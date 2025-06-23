@@ -1,2 +1,4 @@
-prometheus-client
-requests
+httpx==0.28.1
+prometheus_client==0.22.1
+certifi==2025.6.15
+pip_system_certs==5.2

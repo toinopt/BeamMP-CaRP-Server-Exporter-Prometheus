@@ -7,7 +7,7 @@ services:
       - "${PORT:-9584}:9584"
     environment:
       - PORT=${PORT:-9584}
-      - SERVER_NAME_FILTER=${SERVER_NAME_FILTER:-[^b🐟 CaRP^r Test Server]}
+      - SERVER_NAME_FILTER=${SERVER_NAME_FILTER:-BeamSharp}
       - LOGGING=${LOGGING:-true}
     volumes:
       - beammp_logs:/var/log/beammp
