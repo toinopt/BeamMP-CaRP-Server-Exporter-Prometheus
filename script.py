@@ -4,14 +4,23 @@ import time
 from collections import defaultdict
 from prometheus_client import start_http_server, Gauge, Info
 import requests
-import json
+
+VERSION = "1.1.0"
 
 # Configuration variables
 LOGGING = os.getenv('LOGGING', 'true').lower() == 'true'
 
-# Configure logging if enabled
+# Configure logging — always log to console, optionally also to file
+log_format = '%(asctime)s - %(levelname)s - %(message)s'
 if LOGGING:
-    logging.basicConfig(level=logging.INFO, filename='/var/log/beammp/beammp_players.log', format='%(asctime)s - %(levelname)s - %(message)s')
+    logging.basicConfig(
+        level=logging.INFO,
+        format=log_format,
+        handlers=[
+            logging.FileHandler('/var/log/beammp/beammp_players.log'),
+            logging.StreamHandler()  # Also log to stdout for docker logs
+        ]
+    )
     logging.info("Logging enabled.")
 else:
     logging.disable(logging.CRITICAL)  # Disable logging if not enabled
@@ -27,47 +36,73 @@ logging.info(f"SERVER_NAME_FILTER: {SERVER_NAME_FILTER}")
 
 def fetch_server_data():
     url = "https://backend.beammp.com/servers"
+    headers = {"User-Agent": f"BeamMP-Server-Exporter/{VERSION}"}
     try:
-        response = requests.post(url)
+        response = requests.post(url, headers=headers)
         response.raise_for_status()  # Raise exception for 4xx or 5xx status codes
         return response.json()
     except requests.exceptions.HTTPError as http_err:
         logging.error(f"HTTP error occurred: {http_err}")
     except Exception as err:
         logging.error(f"Other error occurred: {err}")
-    return []
+    return None
 
 def update_metrics():
     server_data = fetch_server_data()
+
+    # If the API call failed, don't update metrics at all — keep last known state
+    # but don't report stale zeros
+    if server_data is None:
+        logging.warning("Failed to fetch server data, skipping metrics update.")
+        return
+
     total_players = 0  # Initialize total players counter
     total_max_players = 0  # Initialize total max players counter
     server_map_players = defaultdict(int)  # Initialize dictionary to track players per server map
+    current_servers = set()  # Track servers seen this cycle
+    current_maps = set()  # Track maps seen this cycle
+
     for server in server_data:
-        sname = server.get('sname')
-        if SERVER_NAME_FILTER not in sname:
+        sname = server.get('sname', '')
+        if not sname or (SERVER_NAME_FILTER and SERVER_NAME_FILTER not in sname):
             continue
         
-        players = int(server.get('players'))
+        players = int(server.get('players', 0))
         total_players += players  # Add players to total players counter
         
-        max_players = int(server.get('maxplayers'))
+        max_players = int(server.get('maxplayers', 0))
         total_max_players += max_players  # Add max players to total max players counter
         
-        map_name = server.get('map')
+        map_name = server.get('map', 'unknown')
         server_map_players[map_name] += players
+        current_maps.add(map_name)
         
-        if sname:
-            server_name_metric.labels(sname)
-            server_players_metric.labels(sname).set(players)  # Track number of players connected
-            server_max_players_metric.labels(sname).set(max_players)  # Track max players
+        current_servers.add(sname)
+        server_name_metric.labels(sname)
+        server_players_metric.labels(sname).set(players)  # Track number of players connected
+        server_max_players_metric.labels(sname).set(max_players)  # Track max players
     
-        players_list = server.get('playerslist', [])
+        players_list = server.get('playerslist', '') or ''
         
         # Log server data in the desired format if logging is enabled
         if LOGGING:
             logging.info(f"{sname} - {players_list} - Players: {players} - Max Players: {max_players}")
 
+    # Remove metrics for servers that are no longer reporting
+    global previous_servers, previous_maps
+    stale_servers = previous_servers - current_servers
+    for sname in stale_servers:
+        logging.info(f"Removing stale metrics for server: {sname}")
+        server_players_metric.remove(sname)
+        server_max_players_metric.remove(sname)
 
+    stale_maps = previous_maps - current_maps
+    for map_name in stale_maps:
+        logging.info(f"Removing stale metrics for map: {map_name}")
+        server_map_players_metric.remove(map_name)
+
+    previous_servers = current_servers
+    previous_maps = current_maps
 
     # Set the total players metric
     total_players_metric.set(total_players)
@@ -97,6 +132,10 @@ if __name__ == '__main__':
     # Start HTTP server to expose Prometheus metrics
     start_http_server(PORT)  # Use the port defined in the environment variable or default to 9584
     
+    # Track previously seen servers and maps to detect stale metrics
+    previous_servers = set()
+    previous_maps = set()
+
     # Update metrics and log player information every 60 seconds
     while True:
         update_metrics()
