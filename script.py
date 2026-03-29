@@ -5,7 +5,7 @@ from collections import defaultdict
 from prometheus_client import start_http_server, Gauge, Info
 import requests
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # Configuration variables
 LOGGING = os.getenv('LOGGING', 'true').lower() == 'true'
@@ -47,14 +47,43 @@ def fetch_server_data():
         logging.error(f"Other error occurred: {err}")
     return None
 
+def clear_all_metrics():
+    """Remove all per-server and per-map label sets and reset totals."""
+    global previous_servers, previous_maps
+    for sname in previous_servers:
+        try:
+            server_players_metric.remove(sname)
+            server_max_players_metric.remove(sname)
+            server_name_metric.remove(sname)
+        except KeyError:
+            pass
+    for map_name in previous_maps:
+        try:
+            server_map_players_metric.remove(map_name)
+        except KeyError:
+            pass
+    previous_servers = set()
+    previous_maps = set()
+    total_players_metric.set(0)
+    total_max_players_metric.set(0)
+
 def update_metrics():
+    global previous_servers, previous_maps, consecutive_failures
+
     server_data = fetch_server_data()
 
-    # If the API call failed, don't update metrics at all — keep last known state
-    # but don't report stale zeros
+    # If the API call failed, count consecutive failures.
+    # After 3 consecutive failures (~3 minutes), clear all metrics
+    # so we stop reporting stale data.
     if server_data is None:
-        logging.warning("Failed to fetch server data, skipping metrics update.")
+        consecutive_failures += 1
+        logging.warning(f"Failed to fetch server data ({consecutive_failures} consecutive failure(s)).")
+        if consecutive_failures >= 3:
+            logging.warning("3+ consecutive API failures — clearing all metrics.")
+            clear_all_metrics()
         return
+
+    consecutive_failures = 0  # Reset on success
 
     total_players = 0  # Initialize total players counter
     total_max_players = 0  # Initialize total max players counter
@@ -89,17 +118,23 @@ def update_metrics():
             logging.info(f"{sname} - {players_list} - Players: {players} - Max Players: {max_players}")
 
     # Remove metrics for servers that are no longer reporting
-    global previous_servers, previous_maps
     stale_servers = previous_servers - current_servers
     for sname in stale_servers:
         logging.info(f"Removing stale metrics for server: {sname}")
-        server_players_metric.remove(sname)
-        server_max_players_metric.remove(sname)
+        try:
+            server_players_metric.remove(sname)
+            server_max_players_metric.remove(sname)
+            server_name_metric.remove(sname)
+        except KeyError:
+            pass
 
     stale_maps = previous_maps - current_maps
     for map_name in stale_maps:
         logging.info(f"Removing stale metrics for map: {map_name}")
-        server_map_players_metric.remove(map_name)
+        try:
+            server_map_players_metric.remove(map_name)
+        except KeyError:
+            pass
 
     previous_servers = current_servers
     previous_maps = current_maps
@@ -135,6 +170,7 @@ if __name__ == '__main__':
     # Track previously seen servers and maps to detect stale metrics
     previous_servers = set()
     previous_maps = set()
+    consecutive_failures = 0
 
     # Update metrics and log player information every 60 seconds
     while True:
